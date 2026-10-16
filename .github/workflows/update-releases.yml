@@ -1,0 +1,109 @@
+name: Track Superluminal releases
+
+on:
+  schedule:
+    # Daily. superluminal.eu's download page links only the newest Linux build.
+    - cron: '17 10 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-releases
+  cancel-in-progress: false
+
+jobs:
+  update:
+    # From main only: the job commits the new release there.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Find the newest Linux release on superluminal.eu
+        id: latest
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Cloudflare in front of superluminal.eu refuses curl's own user agent.
+          page=$(curl -fsSL --retry 3 \
+            --user-agent 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36' \
+            --header 'Accept: text/html,application/xhtml+xml' \
+            https://superluminal.eu/download/) || {
+            echo "::error::superluminal.eu/download/ could not be fetched."
+            exit 1
+          }
+          # Only the official installer host is accepted.
+          url=$(grep -oE 'https://superluminal\.blob\.core\.windows\.net/public-installers/SuperluminalLinux-[0-9][0-9A-Za-z.-]*\.tar\.gz' <<<"$page" | sort -uV | tail -n 1 || true)
+          if [[ -z "$url" ]]; then
+            echo "::error::superluminal.eu/download/ no longer links a SuperluminalLinux tarball; the page may have changed."
+            exit 1
+          fi
+          version=${url##*/SuperluminalLinux-}
+          version=${version%.tar.gz}
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if jq -e --arg v "$version" 'has($v)' releases.json > /dev/null; then
+            echo "Superluminal $version is already in releases.json." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Superluminal $version is new."
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+        if: steps.latest.outputs.new == 'true'
+
+      - name: Add it to releases.json
+        if: steps.latest.outputs.new == 'true'
+        shell: bash
+        env:
+          URL: ${{ steps.latest.outputs.url }}
+          VERSION: ${{ steps.latest.outputs.version }}
+        run: |
+          set -euo pipefail
+          hash=$(nix store prefetch-file --json "$URL" | jq -r .hash)
+          jq --arg v "$VERSION" --arg url "$URL" --arg hash "$hash" \
+            '. + {($v): {"x86_64-linux": {url: $url, hash: $hash}}}' \
+            releases.json > "$RUNNER_TEMP/releases.json"
+          mv "$RUNNER_TEMP/releases.json" releases.json
+          git diff -- releases.json
+
+      - name: Build it
+        if: steps.latest.outputs.new == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+        run: |
+          set -euo pipefail
+          # --no-link: the repository tracks a result symlink, which must stay as it is.
+          nix build --no-link --no-update-lock-file --print-build-logs ".#\"$VERSION\""
+          latest=$(nix eval --raw --no-update-lock-file .#latest.version)
+          if [[ "$latest" != "$VERSION" ]]; then
+            echo "::warning::$VERSION was added, but Nix orders $latest after it, so latest stays $latest."
+          fi
+
+      - name: Commit it to main
+        if: steps.latest.outputs.new == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          URL: ${{ steps.latest.outputs.url }}
+          VERSION: ${{ steps.latest.outputs.version }}
+        run: |
+          set -euo pipefail
+          git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit --quiet \
+            -m "Add Superluminal $VERSION" \
+            -m "From $URL, as superluminal.eu/download/ links it." \
+            -- releases.json
+          # Refused if main moved during the build; the next run adds it on top.
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/main
+          echo "Added Superluminal $VERSION to releases.json." >> "$GITHUB_STEP_SUMMARY"

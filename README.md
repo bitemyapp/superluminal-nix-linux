@@ -67,6 +67,8 @@ superluminal.packages.${system}."1.0.7510.599-alpha"
 
 To add a release, append its version, official archive URL, and fixed SHA-256 hash to `releases.json`. It automatically becomes `default`, `latest`, and `superluminal` when its version is newer than every existing entry.
 
+In this fork, the [Track Superluminal releases](.github/workflows/update-releases.yml) workflow does this daily. When superluminal.eu's download page links a Linux release that isn't in `releases.json`, it adds the entry, builds it, and commits it to `main`. Run it by hand from the Actions tab, or with `gh workflow run update-releases.yml`.
+
 ## Notes
 
 - Each entry in `releases.json` contains the official archive URL and its fixed SHA-256 hash.
